@@ -1,15 +1,13 @@
 """
-Classroom counter: heads -> body masks -> sleeve type. CPU only.
+Classroom counter: head detection -> torso box -> sleeve type (no SAM, no training).
+CPU only. Runs the whole pipeline about once per second.
 
   python classroom_counter.py                       # webcam
   python classroom_counter.py --source test.jpg     # photo
-  python classroom_counter.py --source clip.mp4     # video file
-  python classroom_counter.py --tiles 2             # better for crowded rooms (slower)
-  python classroom_counter.py --save-crops crops    # save masked crops for labelling
+  python classroom_counter.py --source clip.mp4     # video
 Press 'q' in the video window to quit.
 """
 import argparse
-import os
 import threading
 import time
 
@@ -17,12 +15,13 @@ import cv2
 import numpy as np
 import torch
 import torchvision
-from PIL import Image
-from ultralytics import SAM, YOLO
+from ultralytics import YOLO
 
-from sleeve_utils import SleeveClassifier
+from sleeve_utils import SleeveParser
 
 COLORS = {"long": (0, 200, 0), "short": (0, 140, 255), "unsure": (170, 170, 170)}
+SHOW = {"long": "long", "short": "short", "unsure": "short?"}   # unsure counts as short
+MIN_CROP = 24      # torso crops smaller than this (pixels) are too tiny to read
 
 
 # ---------------------------------------------------------------- video input
@@ -107,108 +106,178 @@ def detect_heads(model, frame, conf, imgsz, tiles):
     return boxes[keep.numpy()]
 
 
-# ---------------------------------------------------------------- body masks
-def body_prompt_box(head, W, H):
+# ---------------------------------------------------------------- torso box logic
+def ideal_torso(head):
+    """Expected upper-body box under a head: shoulders down to ~2.5 head-heights."""
     x1, y1, x2, y2 = head
     w, h = x2 - x1, y2 - y1
     cx = (x1 + x2) / 2
-    return [max(0, cx - 1.3 * w), max(0, y1),
-            min(W - 1, cx + 1.3 * w), min(H - 1, y2 + 2.5 * h)]
+    return cx - 1.3 * w, y2, cx + 1.3 * w, y2 + 2.5 * h
 
 
-def get_body_masks(sam, frame, heads):
-    H, W = frame.shape[:2]
-    prompts = [body_prompt_box(h, W, H) for h in heads]
-    res = sam(frame, bboxes=prompts, device="cpu", verbose=False)[0]
-    raw = res.masks.data.cpu().numpy().astype(bool)
+def prepare_torso(heads, i, rgb, W, H):
+    """Returns (crop or None, visible_fraction).
+    - Area outside the image counts as hidden.
+    - Heads lower in the image (nearer to a front camera) block this person's torso;
+      the area under them is greyed out and counted as hidden."""
+    head = heads[i]
+    ix1, iy1, ix2, iy2 = ideal_torso(head)
+    ideal_area = max(1.0, (ix2 - ix1) * (iy2 - iy1))
+    bx1, by1 = int(max(0, ix1)), int(max(0, iy1))
+    bx2, by2 = int(min(W, ix2)), int(min(H, iy2))
+    if bx2 - bx1 < MIN_CROP or by2 - by1 < MIN_CROP:
+        return None, 0.0
 
-    masks = []
-    for i, m in enumerate(raw):
-        if m.shape != (H, W):
-            m = cv2.resize(m.astype(np.uint8), (W, H),
-                           interpolation=cv2.INTER_NEAREST).astype(bool)
-        bx1, by1, bx2, by2 = [int(v) for v in prompts[i]]
-        limit = np.zeros((H, W), bool)
-        limit[by1:by2, bx1:bx2] = True
-        m = m & limit
-        for j, other in enumerate(heads):       # cut out neighbours' heads
-            if j != i:
-                ox1, oy1, ox2, oy2 = [int(v) for v in other]
-                m[oy1:oy2, ox1:ox2] = False
-        masks.append(m)
-    return masks
+    blocked = np.zeros((by2 - by1, bx2 - bx1), bool)
+    hh = head[3] - head[1]
+    cy = (head[1] + head[3]) / 2
+    for j, o in enumerate(heads):
+        if j == i:
+            continue
+        ocy = (o[1] + o[3]) / 2
+        if ocy > cy + 0.6 * hh:                      # clearly nearer to the camera
+            ow = o[2] - o[0]
+            ocx = (o[0] + o[2]) / 2
+            rx1 = int(max(bx1, ocx - 1.3 * ow)); rx2 = int(min(bx2, ocx + 1.3 * ow))
+            ry1 = int(max(by1, o[1]));            ry2 = by2
+            if rx2 > rx1 and ry2 > ry1:
+                blocked[ry1 - by1:ry2 - by1, rx1 - bx1:rx2 - bx1] = True
+
+    visible = float((~blocked).sum()) / ideal_area
+    crop = rgb[by1:by2, bx1:bx2].copy()
+    crop[blocked] = 128
+    return crop, visible
 
 
-def make_crop(frame_rgb, mask):
-    ys, xs = np.where(mask)
-    if len(ys) < 100:
-        return None
-    img = frame_rgb.copy()
-    img[~mask] = 128
-    return Image.fromarray(img[ys.min():ys.max() + 1, xs.min():xs.max() + 1])
+def decide(stats, visible, args):
+    """Returns (label, score, note). 'unsure' is shown/counted as short."""
+    if stats is None:
+        return "unsure", 0.0, "too small"
+    if visible < args.min_visible:
+        return "unsure", visible, f"hidden {visible:.0%}"
+    clothes = (stats["upper"] + stats["arm"]) / stats["content"]
+    if clothes < args.min_clothes:
+        return "unsure", clothes, "no shirt seen"
+    arm_ratio = stats["arm"] / max(1, stats["arm"] + stats["upper"])
+    return ("short" if arm_ratio >= args.arm_ratio else "long"), arm_ratio, ""
+
+
+def iou(a, b):
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
 
 
 # ---------------------------------------------------------------- drawing
-def draw(frame, heads, masks, results):
-    overlay = frame.copy()
-    for m, (label, _) in zip(masks, results):
-        overlay[m] = COLORS[label]
-    out = cv2.addWeighted(overlay, 0.35, frame, 0.65, 0)
-    for h, (label, conf) in zip(heads, results):
-        x1, y1, x2, y2 = [int(v) for v in h]
-        cv2.rectangle(out, (x1, y1), (x2, y2), COLORS[label], 2)
-        cv2.putText(out, f"{label} {conf:.2f}", (x1, max(15, y1 - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLORS[label], 1)
-    n = {k: sum(1 for r in results if r[0] == k) for k in COLORS}
-    lines = [f"Students (heads): {len(heads)}", f"Long sleeve: {n['long']}",
-             f"Short sleeve: {n['short']}", f"Unsure: {n['unsure']}"]
+def draw(frame, entries):
+    out = frame.copy()
+    H, W = frame.shape[:2]
+    for e in entries:
+        col = COLORS[e["label"]]
+        tx1, ty1, tx2, ty2 = [int(v) for v in ideal_torso(e["box"])]
+        cv2.rectangle(out, (max(0, tx1), max(0, ty1)), (min(W - 1, tx2), min(H - 1, ty2)), col, 1)
+        x1, y1, x2, y2 = [int(v) for v in e["box"]]
+        cv2.rectangle(out, (x1, y1), (x2, y2), col, 2)
+        text = SHOW[e["label"]] + (f" {e['score']:.2f}" if e["label"] != "unsure" else "")
+        if e["note"]:
+            text += f" ({e['note']})"
+        cv2.putText(out, text, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
+
+    n_long = sum(e["label"] == "long" for e in entries)
+    n_short = sum(e["label"] == "short" for e in entries)
+    n_assumed = sum(e["label"] == "unsure" for e in entries)
+    lines = [f"Students (heads): {len(entries)}",
+             f"Long sleeve: {n_long}",
+             f"Short sleeve: {n_short + n_assumed} (assumed: {n_assumed})"]
     for i, t in enumerate(lines):
         cv2.putText(out, t, (10, 28 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
         cv2.putText(out, t, (10, 28 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     return out
 
 
-# ---------------------------------------------------------------- main
-def process(frame, head_model, sam, sleeve, args):
+# ---------------------------------------------------------------- main loop
+def process(frame, head_model, parser, cache, args):
+    H, W = frame.shape[:2]
     heads = detect_heads(head_model, frame, args.conf, args.imgsz, args.tiles)
     print(f"heads found: {len(heads)}")
-    if len(heads) == 0:
-        return draw(frame, [], [], [])
-    masks = get_body_masks(sam, frame, heads)
+    now = time.time()
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    crops = [make_crop(rgb, m) for m in masks]
 
-    if args.save_crops:
-        os.makedirs(args.save_crops, exist_ok=True)
-        stamp = int(time.time())
-        for i, c in enumerate(crops):
-            if c is not None:
-                c.save(os.path.join(args.save_crops, f"{stamp}_{i}.png"))
+    # Reuse cached results for heads that haven't moved (classroom = mostly static)
+    entries, todo, used = [None] * len(heads), [], set()
+    for i, h in enumerate(heads):
+        best, bj = 0.0, -1
+        for j, c in enumerate(cache):
+            if j in used:
+                continue
+            v = iou(h, c["box"])
+            if v > best:
+                best, bj = v, j
+        if bj >= 0 and best >= 0.5 and now - cache[bj]["time"] < args.recheck_seconds:
+            used.add(bj)
+            e = dict(cache[bj])
+            e["box"] = h
+            entries[i] = e
+        else:
+            todo.append(i)
 
-    results = sleeve.predict(crops)
-    return draw(frame, heads, masks, results)
+    # Run the sleeve parser only on new / changed / expired heads
+    if todo:
+        jobs = []
+        for i in todo:
+            crop, visible = prepare_torso(heads, i, rgb, W, H)
+            if crop is not None and visible >= args.min_visible:
+                jobs.append((i, crop, visible))
+            else:
+                label, score, note = decide(None if crop is None else {"upper": 0, "arm": 0, "content": 1},
+                                            visible, args) if crop is not None else ("unsure", 0.0, "too small")
+                entries[i] = {"box": heads[i], "label": label, "score": score, "note": note, "time": now}
+        if jobs:
+            stats = parser.parse([c for _, c, _ in jobs])
+            for (i, _, visible), st in zip(jobs, stats):
+                label, score, note = decide(st, visible, args)
+                entries[i] = {"box": heads[i], "label": label, "score": score, "note": note, "time": now}
+        print(f"re-analysed {len(todo)} head(s), reused {len(heads) - len(todo)}")
+
+    return draw(frame, entries), entries
+
+
+def shrink(frame, max_width):
+    h, w = frame.shape[:2]
+    if w <= max_width:
+        return frame
+    s = max_width / w
+    return cv2.resize(frame, (max_width, int(h * s)), interpolation=cv2.INTER_AREA)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default="0", help="0 = webcam, or photo/video path")
     ap.add_argument("--head-weights", default="medium.pt")
-    ap.add_argument("--clf", default="sleeve_clf.joblib", help="trained sleeve classifier")
-    ap.add_argument("--conf", type=float, default=0.25)
-    ap.add_argument("--imgsz", type=int, default=960)
-    ap.add_argument("--tiles", type=int, default=1, help="1 = off, 2 = 2x2 tiles, 3 = 3x3")
+    ap.add_argument("--conf", type=float, default=0.25, help="head detection threshold")
+    ap.add_argument("--imgsz", type=int, default=960, help="head detector input size")
+    ap.add_argument("--tiles", type=int, default=2, help="1 = off, 2 = 2x2, 3 = 3x3")
+    ap.add_argument("--min-visible", type=float, default=0.20,
+                    help="min fraction of torso box not blocked by people in front")
+    ap.add_argument("--min-clothes", type=float, default=0.10,
+                    help="min fraction of the crop that must be shirt/arm pixels")
+    ap.add_argument("--arm-ratio", type=float, default=0.12,
+                    help="bare-arm share at/above which a person counts as short sleeve")
+    ap.add_argument("--parse-size", type=int, default=384, help="SegFormer input size")
+    ap.add_argument("--recheck-seconds", type=float, default=30.0)
+    ap.add_argument("--max-width", type=int, default=1280)
     ap.add_argument("--interval", type=float, default=1.0)
-    ap.add_argument("--save-crops", default=None, help="folder to save crops for labelling")
     args = ap.parse_args()
 
     print("Loading head detector...")
     head_model = YOLO(args.head_weights)
-    print("Loading MobileSAM (downloads on first run)...")
-    sam = SAM("mobile_sam.pt")
-    sleeve = SleeveClassifier(args.clf)
+    parser = SleeveParser(args.parse_size)
 
     if args.source.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-        out = process(cv2.imread(args.source), head_model, sam, sleeve, args)
+        frame = shrink(cv2.imread(args.source), args.max_width)
+        out, _ = process(frame, head_model, parser, [], args)
         cv2.imshow("Classroom counter (any key to close)", out)
         cv2.waitKey(0)
         return
@@ -219,6 +288,7 @@ def main():
     else:
         src = VideoFile(args.source, args.interval)
 
+    cache = []
     print("Running. Click the video window and press 'q' to quit.")
     while True:
         t0 = time.time()
@@ -226,7 +296,7 @@ def main():
         if frame is None:
             print("No more frames.")
             break
-        out = process(frame, head_model, sam, sleeve, args)
+        out, cache = process(shrink(frame, args.max_width), head_model, parser, cache, args)
         print(f"cycle took {time.time() - t0:.1f}s")
         cv2.imshow("Classroom counter (press q to quit)", out)
         wait_ms = max(1, int((args.interval - (time.time() - t0)) * 1000))
